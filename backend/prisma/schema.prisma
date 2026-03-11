@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  name       String
+  studentId  String?
+  password   String?
+  department String?
+  avatarUrl  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  workspaces WorkspaceMember[]
+  tasksAssigned Task[] @relation("assignedTasks")
+  tasksCreated  Task[] @relation("createdTasks")
+  comments      TaskComment[]
+  chatMessages  ChatMessage[]
+  readReceipts  MessageReadReceipt[]
+}
+
+model Workspace {
+  id          String   @id @default(uuid())
+  inviteCode  String   @unique
+  name        String
+  subject     String?
+  deadline    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members     WorkspaceMember[]
+  tasks       Task[]
+  chatMessages ChatMessage[]
+}
+
+model WorkspaceMember {
+  id          String   @id @default(uuid())
+  userId      String
+  workspaceId String
+  role        String   @default("MEMBER") // LEADER or MEMBER
+  joinedAt    DateTime @default(now())
+
+  user        User      @relation(fields: [userId], references: [id])
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  isMuted     Boolean   @default(false)
+
+  @@unique([userId, workspaceId])
+}
+
+model ChatMessage {
+  id          String   @id @default(uuid())
+  workspaceId String
+  userId      String
+  content     String
+  createdAt   DateTime @default(now())
+
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  user        User      @relation(fields: [userId], references: [id])
+  readReceipts MessageReadReceipt[]
+}
+
+model MessageReadReceipt {
+  id          String   @id @default(uuid())
+  messageId   String
+  userId      String
+  readAt      DateTime @default(now())
+
+  message     ChatMessage @relation(fields: [messageId], references: [id])
+  user        User        @relation(fields: [userId], references: [id])
+
+  @@unique([messageId, userId]) // 한 유저가 한 메시지를 여러 번 읽음 처리하는 것 방지
+}
+
+model Task {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  title         String
+  description   String?
+  points        Int      @default(1)
+  status        String   @default("TODO") // TODO, IN_PROGRESS, IN_REVIEW, DONE
+  submitFormat  String   @default("TEXT") // TEXT, FILE, LINK
+  submitContent String?
+  feedback      String?
+  deadline      DateTime?
+  
+  assignedToId  String?
+  createdById   String
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  workspace     Workspace @relation(fields: [workspaceId], references: [id])
+  assignedTo    User?     @relation("assignedTasks", fields: [assignedToId], references: [id])
+  createdBy     User      @relation("createdTasks", fields: [createdById], references: [id])
+  comments      TaskComment[]
+}
+
+model TaskComment {
+  id        String   @id @default(uuid())
+  taskId    String
+  userId    String
+  content   String
+  createdAt DateTime @default(now())
+
+  task      Task @relation(fields: [taskId], references: [id])
+  user      User @relation(fields: [userId], references: [id])
+}
