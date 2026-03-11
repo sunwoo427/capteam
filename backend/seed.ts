@@ -97,14 +97,14 @@ async function main() {
                             status: 'DONE',
                             points: 10,
                             createdById: 'test-user-id',
-                            assignedToId: 'dummy-1',
+                            assignees: { create: [{ userId: 'dummy-1' }] },
                         },
                         {
                             title: '메인 API 개발',
                             status: 'IN_PROGRESS',
                             points: 20,
                             createdById: 'test-user-id',
-                            assignedToId: 'test-user-id',
+                            assignees: { create: [{ userId: 'test-user-id' }] },
                             deadline: new Date(new Date().getTime() + 3 * 24 * 60 * 60 * 1000)
                         },
                         {
@@ -112,7 +112,7 @@ async function main() {
                             status: 'TODO',
                             points: 5,
                             createdById: 'test-user-id',
-                            assignedToId: 'dummy-2',
+                            assignees: { create: [{ userId: 'dummy-2' }] },
                             deadline: new Date(new Date().getTime() + 5 * 24 * 60 * 60 * 1000)
                         }
                     ]

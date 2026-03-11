@@ -33,6 +33,34 @@ router.get('/:workspaceId/chat', async (req: Request, res: Response) => {
     }
 });
 
+// 1.5. 특정 사용자의 안 읽은 메시지 개수 조회 API
+router.get('/:workspaceId/chat/unread', async (req: Request, res: Response) => {
+    try {
+        const workspaceId = req.params.workspaceId as string;
+        const userId = req.query.userId as string;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'userId query parameter is required' });
+        }
+
+        // 해당 워크스페이스의 메시지 중 내가 쓴 것이 아니며, 내가 읽음 처리하지 않은 메시지 수 카운트
+        const unreadCount = await prisma.chatMessage.count({
+            where: {
+                workspaceId: workspaceId,
+                userId: { not: userId },
+                readReceipts: {
+                    none: { userId: userId }
+                }
+            }
+        });
+
+        res.status(200).json({ unreadCount });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch unread count' });
+    }
+});
+
 // 2. 메시지 읽음 처리 (내역 추가) API
 router.post('/:workspaceId/chat/read', async (req: Request, res: Response) => {
     try {

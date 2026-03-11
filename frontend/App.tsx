@@ -21,7 +21,7 @@ export type RootStackParamList = {
   CreateWorkspace: { userId: string };
   JoinWorkspace: { userId: string };
   Dashboard: { workspaceId: string; workspaceName: string; userId: string };
-  Chat: { workspaceId: string; workspaceName: string };
+  Chat: { workspaceId: string; workspaceName: string; userId: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();

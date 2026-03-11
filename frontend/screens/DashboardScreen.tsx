@@ -2,8 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, ScrollView, Dimensions, TouchableOpacity, Platform, ActivityIndicator, Alert, Modal, TextInput } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRoute, RouteProp, useNavigation } from '@react-navigation/native';
+import { useRoute, RouteProp, useNavigation, useFocusEffect } from '@react-navigation/native';
 import axios from 'axios';
+import { io, Socket } from 'socket.io-client';
+import DateTimePicker from '@react-native-community/datetimepicker';
 
 type RootStackParamList = {
     Dashboard: { workspaceId: string; workspaceName: string; userId: string };
@@ -22,6 +24,10 @@ export default function DashboardScreen() {
     const [loading, setLoading] = useState(true);
     const [isDelegationModalVisible, setDelegationModalVisible] = useState(false);
 
+    // 안 읽은 채팅 개수
+    const [unreadChatCount, setUnreadChatCount] = useState(0);
+    const socketRef = React.useRef<Socket | null>(null);
+
     // Custom Confirm Modal State for Web Compatibility
     const [confirmVisible, setConfirmVisible] = useState(false);
     const [confirmDetails, setConfirmDetails] = useState({
@@ -39,8 +45,33 @@ export default function DashboardScreen() {
     const [newTaskDesc, setNewTaskDesc] = useState('');
     const [newTaskPoints, setNewTaskPoints] = useState('1');
     const [newTaskDeadline, setNewTaskDeadline] = useState('');
-    const [newTaskAssignee, setNewTaskAssignee] = useState<string | null>(null);
+    const [showDatePicker, setShowDatePicker] = useState(false);
+    const [newTaskAssignees, setNewTaskAssignees] = useState<string[]>([]);
     const [addingTask, setAddingTask] = useState(false);
+
+    // 기여도 통계 state
+    const [statsData, setStatsData] = useState<{ stats: { userId: string; name: string; points: number; percent: number }[]; totalPoints: number } | null>(null);
+    const [sharingStat, setSharingStat] = useState(false);
+
+    // 설정 모달 state
+    const [isSettingsVisible, setSettingsVisible] = useState(false);
+    const [editingName, setEditingName] = useState('');
+    const [editingDeadline, setEditingDeadline] = useState('');
+    const [showSettingsDatePicker, setShowSettingsDatePicker] = useState(false);
+
+    const toggleAssignee = (userId: string) => {
+        setNewTaskAssignees(prev =>
+            prev.includes(userId) ? prev.filter(id => id !== userId) : [...prev, userId]
+        );
+    };
+
+    const handleDateChange = (event: any, selectedDate?: Date) => {
+        if (Platform.OS === 'android') setShowDatePicker(false);
+        if (selectedDate) {
+            const dateString = selectedDate.toISOString().split('T')[0];
+            setNewTaskDeadline(dateString);
+        }
+    };
 
     const createTask = async () => {
         if (!newTaskTitle.trim()) return;
@@ -51,13 +82,13 @@ export default function DashboardScreen() {
                 description: newTaskDesc.trim() || null,
                 points: parseInt(newTaskPoints) || 1,
                 deadline: newTaskDeadline.trim() || null,
-                assignedToId: newTaskAssignee || null,
+                assignedToIds: newTaskAssignees,
                 createdById: USER_ID,
             });
             const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
             setWorkspace(res.data);
             setAddTaskModalVisible(false);
-            setNewTaskTitle(''); setNewTaskDesc(''); setNewTaskPoints('1'); setNewTaskDeadline(''); setNewTaskAssignee(null);
+            setNewTaskTitle(''); setNewTaskDesc(''); setNewTaskPoints('1'); setNewTaskDeadline(''); setNewTaskAssignees([]);
         } catch (e: any) {
             const msg = e.response?.data?.error || '태스크 추가에 실패했습니다.';
             if (Platform.OS === 'web') window.alert(msg);
@@ -84,6 +115,170 @@ export default function DashboardScreen() {
         }
     }, [workspaceId]);
 
+    // 화면 포커스 시 및 소켓 연동을 통한 최신 "안 읽음 수" 관리
+    useFocusEffect(
+        React.useCallback(() => {
+            const fetchUnreadCount = async () => {
+                if (!workspaceId || !USER_ID) return;
+                try {
+                    const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}/chat/unread`, {
+                        params: { userId: USER_ID }
+                    });
+                    setUnreadChatCount(res.data.unreadCount || 0);
+                } catch (e) {
+                    console.error('Failed to fetch unread chat count:', e);
+                }
+            };
+            fetchUnreadCount();
+
+            // Socket.io 연동 (대시보드 체류 시 실시간 알람 배지 업데이트)
+            socketRef.current = io(API_URL);
+            const socket = socketRef.current;
+            socket.emit('join_room', workspaceId);
+
+            socket.on('new_message', (msg: any) => {
+                if (msg.userId !== USER_ID) {
+                    setUnreadChatCount(prev => prev + 1);
+                }
+            });
+
+            return () => {
+                socket.disconnect();
+            };
+        }, [workspaceId, USER_ID])
+    );
+
+    const completeTask = async (taskId: string, taskTitle: string) => {
+        // 1. 완료 여부 확인 연십
+        const doComplete = async () => {
+            try {
+                await axios.put(`${API_URL}/api/workspaces/${workspaceId}/tasks/${taskId}/complete`, {
+                    userId: USER_ID
+                });
+                const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+                setWorkspace(res.data);
+
+                // 2. 완료 후 성공 메시지
+                setConfirmDetails({
+                    title: '✅ 반영 완료!',
+                    message: `"${taskTitle}" 태스크가 \n\n반영이 완료되었습니다!`,
+                    confirmText: '확인',
+                    cancelText: '',
+                    onConfirm: () => setConfirmVisible(false),
+                    onCancel: () => setConfirmVisible(false),
+                });
+                setConfirmVisible(true);
+            } catch (e: any) {
+                const msg = e.response?.data?.error || '태스크 완료 전송에 실패했습니다.';
+                if (Platform.OS === 'web') window.alert(msg);
+                else Alert.alert('오류', msg);
+            }
+        };
+
+        // 먼저 확인 다이얼로그 보여주기
+        setConfirmDetails({
+            title: '태스크 완료 확인',
+            message: `"${taskTitle}"
+
+이 태스크를 완료하셨습니까?`,
+            confirmText: '예, 완료했어요',
+            cancelText: '아니요',
+            onConfirm: () => {
+                setConfirmVisible(false);
+                doComplete();
+            },
+            onCancel: () => setConfirmVisible(false),
+        });
+        setConfirmVisible(true);
+    };
+
+    const fetchStats = async () => {
+        try {
+            const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}/stats`);
+            setStatsData(res.data);
+        } catch (e) {
+            console.error('Failed to fetch stats:', e);
+        }
+    };
+
+    const shareStatToChat = async () => {
+        if (!statsData || !socketRef.current) return;
+        setSharingStat(true);
+
+        const lines = statsData.stats.map((s, i) => {
+            const medal = i === 0 ? '🏆' : i === 1 ? '🥈' : i === 2 ? '🥉' : '👤';
+            return `${medal} ${s.name}: ${s.points}pts (${s.percent}%)`;
+        }).join('\n');
+
+        const message = `📊 [팀 프로젝트 완료 기여도 결과]\n${lines}\n\n✅ 총 달성: ${statsData.totalPoints}pts`;
+
+        socketRef.current.emit('send_message', {
+            workspaceId,
+            userId: USER_ID,
+            content: message
+        });
+        setSharingStat(false);
+        if (Platform.OS === 'web') window.alert('채팅방에 기여도 결과를 공유했습니다!');
+        else Alert.alert('공유 완료', '채팅방에 기여도 결과를 공유했습니다!');
+    };
+
+    const updateWorkspace = async () => {
+        try {
+            await axios.patch(`${API_URL}/api/workspaces/${workspaceId}`, {
+                userId: USER_ID,
+                name: editingName || undefined,
+                deadline: editingDeadline || undefined,
+            });
+            const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+            setWorkspace(res.data);
+            if (Platform.OS === 'web') window.alert('팀방 정보가 수정되었습니다!');
+            else Alert.alert('완료', '팀방 정보가 수정되었습니다!');
+        } catch (e: any) {
+            const msg = e.response?.data?.error || '수정에 실패했습니다.';
+            if (Platform.OS === 'web') window.alert(msg);
+            else Alert.alert('오류', msg);
+        }
+    };
+
+    const regenerateInvite = async () => {
+        try {
+            const res = await axios.post(`${API_URL}/api/workspaces/${workspaceId}/regenerate-invite`, { userId: USER_ID });
+            const re = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+            setWorkspace(re.data);
+            if (Platform.OS === 'web') window.alert(`새 초대코드: ${res.data.inviteCode}`);
+            else Alert.alert('초대코드 재발급', `새 초대코드: ${res.data.inviteCode}`);
+        } catch (e: any) {
+            const msg = e.response?.data?.error || '재발급에 실패했습니다.';
+            if (Platform.OS === 'web') window.alert(msg);
+            else Alert.alert('오류', msg);
+        }
+    };
+
+    const kickMember = (targetUserId: string, targetName: string) => {
+        setConfirmDetails({
+            title: '팀원 내보내기',
+            message: `${targetName}님을 팀방에서\n내보내시겠습니까?`,
+            confirmText: '내보내기',
+            cancelText: '취소',
+            onConfirm: async () => {
+                setConfirmVisible(false);
+                try {
+                    await axios.delete(`${API_URL}/api/workspaces/${workspaceId}/kick/${targetUserId}`, {
+                        data: { userId: USER_ID }
+                    });
+                    const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+                    setWorkspace(res.data);
+                } catch (e: any) {
+                    const msg = e.response?.data?.error || '내보내기에 실패했습니다.';
+                    if (Platform.OS === 'web') window.alert(msg);
+                    else Alert.alert('오류', msg);
+                }
+            },
+            onCancel: () => setConfirmVisible(false),
+        });
+        setConfirmVisible(true);
+    };
+
     if (loading) {
         return (
             <View style={[styles.container, { justifyContent: 'center', alignItems: 'center', backgroundColor: '#0f172a' }]}>
@@ -97,22 +292,25 @@ export default function DashboardScreen() {
     let dDayText = '마감일 없음';
 
     if (workspace?.deadline && workspace?.createdAt) {
-        const created = new Date(workspace.createdAt).getTime();
-        const deadline = new Date(workspace.deadline).getTime();
         const now = new Date().getTime();
+        const deadline = new Date(workspace.deadline).getTime();
 
         if (now >= deadline) {
-            progressPercent = 100;
             const pastDays = Math.floor((now - deadline) / (1000 * 60 * 60 * 24));
             dDayText = pastDays === 0 ? 'D-Day' : `D+${pastDays}`;
         } else {
-            const total = deadline - created;
-            const elapsed = now - created;
-            progressPercent = Math.max(0, Math.min(100, Math.round((elapsed / total) * 100)));
-
             const daysLeft = Math.ceil((deadline - now) / (1000 * 60 * 60 * 24));
             dDayText = `D-${daysLeft}`;
         }
+    }
+
+    // 새 진행률 계산: DONE 상태인 태스크의 배점(points) 총합 (최대 100%)
+    if (workspace?.tasks && Array.isArray(workspace.tasks)) {
+        const totalDonePoints = workspace.tasks
+            .filter((t: any) => t.status === 'DONE')
+            .reduce((sum: number, t: any) => sum + (t.points || 0), 0);
+
+        progressPercent = Math.min(100, totalDonePoints); // Max 100
     }
 
     const handleLeaveWorkspace = () => {
@@ -229,10 +427,13 @@ export default function DashboardScreen() {
                 <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
 
                     <View style={styles.glassCard}>
-                        <Text style={styles.cardTitle}>전체 진행률</Text>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                            <Text style={styles.cardTitle}>전체 진행률</Text>
+                            <Text style={[styles.progressPercent, { color: '#818cf8', fontSize: 13 }]}>{dDayText}</Text>
+                        </View>
                         <View style={styles.progressHeader}>
-                            <Text style={styles.progressPercent}>{dDayText}</Text>
-                            <Text style={styles.progressValue}>{progressPercent}% (시간 경과)</Text>
+                            <Text style={styles.progressPercent}>{progressPercent}%</Text>
+                            <Text style={styles.progressValue}>(달성도)</Text>
                         </View>
                         <View style={styles.progressBarContainer}>
                             <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
@@ -252,6 +453,57 @@ export default function DashboardScreen() {
                         ))}
                     </View>
 
+                    {/* 기여도 통계 섹션 (달성도 100% 시 자동 노출) */}
+                    {progressPercent >= 100 && (
+                        <View style={styles.glassCard}>
+                            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                                <Text style={styles.cardTitle}>🏆 팀 기여도 통계</Text>
+                                <TouchableOpacity
+                                    style={styles.statsFetchButton}
+                                    onPress={fetchStats}
+                                >
+                                    <Text style={styles.statsFetchButtonText}>통계 계산</Text>
+                                </TouchableOpacity>
+                            </View>
+
+                            {statsData ? (
+                                <>
+                                    {statsData.stats.map((s, i) => {
+                                        const medal = i === 0 ? '🏆' : i === 1 ? '🥈' : i === 2 ? '🥉' : '👤';
+                                        return (
+                                            <View key={s.userId} style={{ marginBottom: 12 }}>
+                                                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                                                    <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>
+                                                        {medal} {s.name}
+                                                    </Text>
+                                                    <Text style={{ color: '#60a5fa', fontWeight: 'bold', fontSize: 14 }}>
+                                                        {s.points}pts ({s.percent}%)
+                                                    </Text>
+                                                </View>
+                                                <View style={styles.statsBarBg}>
+                                                    <View style={[styles.statsBarFill, { width: `${s.percent}%` }]} />
+                                                </View>
+                                            </View>
+                                        );
+                                    })}
+                                    <TouchableOpacity
+                                        style={[styles.completeButton, { marginTop: 12, alignSelf: 'stretch', alignItems: 'center', backgroundColor: '#6366f1' }]}
+                                        onPress={shareStatToChat}
+                                        disabled={sharingStat}
+                                    >
+                                        <Text style={styles.completeButtonText}>
+                                            {sharingStat ? '공유 중...' : '📤 채팅방에 결과 공유하기'}
+                                        </Text>
+                                    </TouchableOpacity>
+                                </>
+                            ) : (
+                                <Text style={{ color: 'rgba(255,255,255,0.5)', textAlign: 'center', paddingVertical: 12 }}>
+                                    위의 "통계 계산" 버튼을 눌러 기여도를 확인하세요!
+                                </Text>
+                            )}
+                        </View>
+                    )}
+
                     <View style={styles.sectionTitleRow}>
                         <Text style={styles.sectionTitle}>진행 중인 태스크</Text>
                         {workspace?.members?.find((m: any) => m.userId === USER_ID)?.role === 'LEADER' && (
@@ -265,26 +517,59 @@ export default function DashboardScreen() {
                     </View>
 
                     {workspace?.tasks && workspace.tasks.length > 0 ? (
-                        workspace.tasks.map((task: any) => (
-                            <TouchableOpacity key={task.id} style={styles.taskCard}>
-                                <View style={styles.taskStatusContainer}>
-                                    <View style={styles.statusDotInProgress} />
-                                    <Text style={styles.taskStatusText}>{task.status}</Text>
-                                </View>
-                                <Text style={styles.taskTitle}>{task.title}</Text>
-                                {task.description ? (
-                                    <Text style={styles.taskDesc}>{task.description}</Text>
-                                ) : null}
-                                <View style={styles.taskFooter}>
-                                    <Text style={styles.taskDeadline}>
-                                        {task.deadline ? `마감일: ${new Date(task.deadline).toLocaleDateString()}` : '마감일 없음'}
-                                    </Text>
-                                    <View style={styles.pointsBadge}>
-                                        <Text style={styles.pointsText}>{task.points} pts</Text>
-                                    </View>
-                                </View>
-                            </TouchableOpacity>
-                        ))
+                        // 완료 안 된 태스크가 먼저, DONE은 낙었을 때
+                        [...workspace.tasks]
+                            .sort((a: any, b: any) => {
+                                if (a.status === 'DONE' && b.status !== 'DONE') return 1;
+                                if (a.status !== 'DONE' && b.status === 'DONE') return -1;
+                                return 0;
+                            })
+                            .map((task: any) => {
+                                const isDone = task.status === 'DONE';
+                                return (
+                                    <TouchableOpacity key={task.id} style={[styles.taskCard, isDone && styles.taskCardDone]}>
+                                        <View style={styles.taskStatusContainer}>
+                                            <View style={[styles.statusDotInProgress, isDone && { backgroundColor: '#10b981' }]} />
+                                            <Text style={[styles.taskStatusText, isDone && { color: '#10b981' }]}>{isDone ? '완료' : task.status}</Text>
+                                            {isDone && (
+                                                <View style={styles.doneBadge}>
+                                                    <Text style={styles.doneBadgeText}>✔ 완료됨</Text>
+                                                </View>
+                                            )}
+                                        </View>
+                                        <Text style={[styles.taskTitle, isDone && { color: 'rgba(255,255,255,0.45)', textDecorationLine: 'line-through' }]}>{task.title}</Text>
+                                        {task.description ? (
+                                            <Text style={styles.taskDesc}>{task.description}</Text>
+                                        ) : null}
+                                        {task.assignees && task.assignees.length > 0 && (
+                                            <View style={styles.assigneesContainer}>
+                                                <Text style={styles.assigneesLabel}>담당자:</Text>
+                                                <Text style={styles.assigneesText}>
+                                                    {task.assignees.map((a: any) => a.user?.name).join(', ')}
+                                                </Text>
+                                            </View>
+                                        )}
+                                        <View style={styles.taskFooter}>
+                                            <View>
+                                                <Text style={styles.taskDeadline}>
+                                                    {task.deadline ? `마감일: ${new Date(task.deadline).toLocaleDateString()}` : '마감일 없음'}
+                                                </Text>
+                                                <View style={[styles.pointsBadge, isDone && { backgroundColor: 'rgba(16,185,129,0.15)', borderColor: 'rgba(16,185,129,0.4)' }]}>
+                                                    <Text style={[styles.pointsText, isDone && { color: '#10b981' }]}>{task.points} pts</Text>
+                                                </View>
+                                            </View>
+                                            {workspace?.members?.find((m: any) => m.userId === USER_ID)?.role === 'LEADER' && !isDone && (
+                                                <TouchableOpacity
+                                                    style={styles.completeButton}
+                                                    onPress={() => completeTask(task.id, task.title)}
+                                                >
+                                                    <Text style={styles.completeButtonText}>완료</Text>
+                                                </TouchableOpacity>
+                                            )}
+                                        </View>
+                                    </TouchableOpacity>
+                                );
+                            })
                     ) : (
                         <View style={[styles.glassCard, { alignItems: 'center', paddingVertical: 40 }]}>
                             <Text style={{ color: 'rgba(255,255,255,0.5)', textAlign: 'center' }}>
@@ -342,20 +627,20 @@ export default function DashboardScreen() {
                                 textAlignVertical="top"
                             />
 
-                            <Text style={styles.taskInputLabel}>담당자 배정</Text>
+                            <Text style={styles.taskInputLabel}>담당자 배정 (다중 선택 가능)</Text>
                             <View style={styles.assigneeRow}>
                                 {/* '없음' 칩 */}
                                 <TouchableOpacity
                                     style={[
                                         styles.assigneeChip,
-                                        newTaskAssignee === null && styles.assigneeChipSelected,
+                                        newTaskAssignees.length === 0 && styles.assigneeChipSelected,
                                     ]}
-                                    onPress={() => setNewTaskAssignee(null)}
+                                    onPress={() => setNewTaskAssignees([])}
                                 >
                                     <Text style={[
                                         styles.assigneeChipText,
-                                        newTaskAssignee === null && styles.assigneeChipTextSelected,
-                                    ]}>없음</Text>
+                                        newTaskAssignees.length === 0 && styles.assigneeChipTextSelected,
+                                    ]}>선택 안함</Text>
                                 </TouchableOpacity>
 
                                 {/* 팀원 칩 목록 */}
@@ -364,13 +649,13 @@ export default function DashboardScreen() {
                                         key={m.userId}
                                         style={[
                                             styles.assigneeChip,
-                                            newTaskAssignee === m.userId && styles.assigneeChipSelected,
+                                            newTaskAssignees.includes(m.userId) && styles.assigneeChipSelected,
                                         ]}
-                                        onPress={() => setNewTaskAssignee(m.userId)}
+                                        onPress={() => toggleAssignee(m.userId)}
                                     >
                                         <Text style={[
                                             styles.assigneeChipText,
-                                            newTaskAssignee === m.userId && styles.assigneeChipTextSelected,
+                                            newTaskAssignees.includes(m.userId) && styles.assigneeChipTextSelected,
                                         ]}>
                                             {m.role === 'LEADER' ? '👑 ' : '👤 '}
                                             {m.user?.name || '팀원'}
@@ -382,13 +667,43 @@ export default function DashboardScreen() {
                             <View style={styles.taskInputRow}>
                                 <View style={{ flex: 1 }}>
                                     <Text style={styles.taskInputLabel}>마감일</Text>
-                                    <TextInput
-                                        style={styles.taskInput}
-                                        placeholder="YYYY-MM-DD"
-                                        placeholderTextColor="rgba(255,255,255,0.3)"
-                                        value={newTaskDeadline}
-                                        onChangeText={setNewTaskDeadline}
-                                    />
+                                    {Platform.OS === 'web' ? (
+                                        <input
+                                            type="date"
+                                            value={newTaskDeadline}
+                                            onChange={(e) => setNewTaskDeadline(e.target.value)}
+                                            style={{
+                                                backgroundColor: 'rgba(255,255,255,0.06)',
+                                                borderRadius: 14,
+                                                padding: '14px 16px',
+                                                color: '#fff',
+                                                fontSize: 15,
+                                                border: '1px solid rgba(255,255,255,0.1)',
+                                                outline: 'none',
+                                                width: '100%',
+                                                boxSizing: 'border-box'
+                                            }}
+                                        />
+                                    ) : (
+                                        <>
+                                            <TouchableOpacity
+                                                style={styles.taskInput}
+                                                onPress={() => setShowDatePicker(true)}
+                                            >
+                                                <Text style={{ color: newTaskDeadline ? '#fff' : 'rgba(255,255,255,0.3)', fontSize: 15 }}>
+                                                    {newTaskDeadline || '날짜 선택...'}
+                                                </Text>
+                                            </TouchableOpacity>
+                                            {showDatePicker && (
+                                                <DateTimePicker
+                                                    value={newTaskDeadline ? new Date(newTaskDeadline) : new Date()}
+                                                    mode="date"
+                                                    display="default"
+                                                    onChange={handleDateChange}
+                                                />
+                                            )}
+                                        </>
+                                    )}
                                 </View>
                                 <View style={{ width: 12 }} />
                                 <View style={{ width: 80 }}>
@@ -485,9 +800,11 @@ export default function DashboardScreen() {
                         <Text style={styles.confirmModalTitle}>{confirmDetails.title}</Text>
                         <Text style={styles.confirmModalMessage}>{confirmDetails.message}</Text>
                         <View style={styles.confirmButtonRow}>
-                            <TouchableOpacity style={styles.confirmCancelButton} onPress={confirmDetails.onCancel}>
-                                <Text style={styles.confirmCancelText}>{confirmDetails.cancelText}</Text>
-                            </TouchableOpacity>
+                            {!!confirmDetails.cancelText && (
+                                <TouchableOpacity style={styles.confirmCancelButton} onPress={confirmDetails.onCancel}>
+                                    <Text style={styles.confirmCancelText}>{confirmDetails.cancelText}</Text>
+                                </TouchableOpacity>
+                            )}
                             <TouchableOpacity style={styles.confirmOkButton} onPress={confirmDetails.onConfirm}>
                                 <Text style={styles.confirmOkText}>{confirmDetails.confirmText}</Text>
                             </TouchableOpacity>
@@ -495,6 +812,24 @@ export default function DashboardScreen() {
                     </View>
                 </View>
             </Modal>
+
+            {/* 채팅 진입 FAB */}
+            <TouchableOpacity
+                style={styles.chatFab}
+                onPress={() => {
+                    setUnreadChatCount(0);
+                    navigation.navigate('Chat', { workspaceId, workspaceName, userId: USER_ID });
+                }}
+            >
+                <Text style={styles.chatFabText}>💬</Text>
+                {unreadChatCount > 0 && (
+                    <View style={styles.chatBadge}>
+                        <Text style={styles.chatBadgeText}>
+                            {unreadChatCount > 99 ? '99+' : unreadChatCount}
+                        </Text>
+                    </View>
+                )}
+            </TouchableOpacity>
 
         </View>
     );
@@ -712,6 +1047,18 @@ const styles = StyleSheet.create({
     taskDesc: {
         color: 'rgba(255,255,255,0.55)', fontSize: 13, marginTop: 4, marginBottom: 4,
     },
+    assigneesContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        marginTop: 4,
+        marginBottom: 8,
+    },
+    assigneesLabel: {
+        color: 'rgba(255,255,255,0.7)', fontSize: 13, fontWeight: '600', marginRight: 6,
+    },
+    assigneesText: {
+        color: '#fff', fontSize: 13,
+    },
     // ─── 공용 인풋 스타일 ───
     taskInputLabel: {
         color: 'rgba(255,255,255,0.65)',
@@ -815,5 +1162,105 @@ const styles = StyleSheet.create({
     },
     assigneeChipTextSelected: {
         color: '#c7d2fe',
+    },
+    chatFab: {
+        position: 'absolute',
+        bottom: 24,
+        right: 24,
+        width: 60,
+        height: 60,
+        borderRadius: 30,
+        backgroundColor: '#4f46e5',
+        justifyContent: 'center',
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.35,
+        shadowRadius: 5,
+        elevation: 8,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.1)',
+    },
+    chatFabText: {
+        fontSize: 26,
+    },
+    chatBadge: {
+        position: 'absolute',
+        top: -4,
+        right: -4,
+        backgroundColor: '#ef4444',
+        minWidth: 22,
+        height: 22,
+        borderRadius: 11,
+        justifyContent: 'center',
+        alignItems: 'center',
+        borderWidth: 2,
+        borderColor: '#0f172a',
+        paddingHorizontal: 4,
+    },
+    chatBadgeText: {
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: 'bold',
+    },
+    completeButton: {
+        backgroundColor: '#10b981',
+        paddingHorizontal: 16,
+        paddingVertical: 8,
+        borderRadius: 20,
+        justifyContent: 'center',
+        alignItems: 'center',
+        shadowColor: '#10b981',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.3,
+        shadowRadius: 4,
+        elevation: 4,
+    },
+    completeButtonText: {
+        color: '#fff',
+        fontWeight: 'bold',
+        fontSize: 13,
+    },
+    taskCardDone: {
+        opacity: 0.7,
+        borderColor: 'rgba(16,185,129,0.25)',
+    },
+    doneBadge: {
+        marginLeft: 8,
+        backgroundColor: 'rgba(16,185,129,0.2)',
+        borderRadius: 10,
+        paddingHorizontal: 8,
+        paddingVertical: 3,
+        borderWidth: 1,
+        borderColor: 'rgba(16,185,129,0.5)',
+    },
+    doneBadgeText: {
+        color: '#10b981',
+        fontSize: 11,
+        fontWeight: 'bold',
+    },
+    statsFetchButton: {
+        backgroundColor: 'rgba(99,102,241,0.2)',
+        borderWidth: 1,
+        borderColor: '#6366f1',
+        paddingHorizontal: 12,
+        paddingVertical: 6,
+        borderRadius: 14,
+    },
+    statsFetchButtonText: {
+        color: '#818cf8',
+        fontWeight: 'bold',
+        fontSize: 12,
+    },
+    statsBarBg: {
+        height: 10,
+        backgroundColor: 'rgba(255,255,255,0.08)',
+        borderRadius: 5,
+        overflow: 'hidden',
+    },
+    statsBarFill: {
+        height: 10,
+        backgroundColor: '#6366f1',
+        borderRadius: 5,
     },
 });

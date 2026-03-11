@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
     View, Text, StyleSheet, FlatList, TextInput,
     TouchableOpacity, KeyboardAvoidingView, Platform,
@@ -6,63 +6,125 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
+import axios from 'axios';
+import { io, Socket } from 'socket.io-client';
+import { RootStackParamList } from '../App';
 
-const CURRENT_USER_ID = 'me';
+const API_URL = Platform.OS === 'web' ? 'http://localhost:3000' : 'http://10.0.2.2:3000';
 
-// 더미 채팅 데이터 (추후 Socket.io + API 연동)
-const DUMMY_MESSAGES = [
-    {
-        id: '1', userId: 'user1', userName: '박미니', content: '안녕하세요 팀원 여러분!',
-        createdAt: '2026-03-10T10:00:00Z',
-        readReceipts: [{ user: { id: 'me', name: '김미니' } }, { user: { id: 'user2', name: '최미니' } }],
-    },
-    {
-        id: '2', userId: 'me', userName: '김미니', content: '안녕하세요! 이번 주 태스크 분배 어떻게 할까요?',
-        createdAt: '2026-03-10T10:02:00Z',
-        readReceipts: [{ user: { id: 'user1', name: '박미니' } }, { user: { id: 'user2', name: '최미니' } }],
-    },
-    {
-        id: '3', userId: 'user2', userName: '최미니', content: '저는 백엔드 API 담당할게요 👍',
-        createdAt: '2026-03-10T10:05:00Z',
-        readReceipts: [{ user: { id: 'user1', name: '박미니' } }],
-    },
-    {
-        id: '4', userId: 'user1', userName: '박미니', content: '그럼 저는 UI 디자인 쪽으로 가겠습니다!',
-        createdAt: '2026-03-10T10:06:00Z',
-        readReceipts: [],
-    },
-];
+type Message = {
+    id: string;
+    userId: string;
+    user: { id: string; name: string; avatarUrl: string | null };
+    content: string;
+    createdAt: string;
+    readReceipts: { user: { id: string; name: string } }[];
+};
 
-type Message = typeof DUMMY_MESSAGES[0];
+type ChatScreenRouteProp = RouteProp<RootStackParamList, 'Chat'>;
 
 export default function WorkspaceChatScreen() {
     const navigation = useNavigation();
+    const route = useRoute<ChatScreenRouteProp>();
+    const { workspaceId, workspaceName, userId: CURRENT_USER_ID } = route.params;
+
     const flatListRef = useRef<FlatList>(null);
-    const [messages, setMessages] = useState(DUMMY_MESSAGES);
+    const [messages, setMessages] = useState<Message[]>([]);
     const [inputText, setInputText] = useState('');
     const [isMuted, setIsMuted] = useState(false);
     const [selectedMsg, setSelectedMsg] = useState<Message | null>(null);
     const [showReceiptModal, setShowReceiptModal] = useState(false);
+    const [totalMembers, setTotalMembers] = useState(3); // 임시
+
+    const socketRef = useRef<Socket | null>(null);
+
+    useEffect(() => {
+        fetchMetadata();
+        loadMessages();
+
+        socketRef.current = io(API_URL);
+        const socket = socketRef.current;
+
+        socket.emit('join_room', workspaceId);
+
+        socket.on('new_message', (msg: Message) => {
+            setMessages(prev => [...prev, msg]);
+            if (msg.userId !== CURRENT_USER_ID) {
+                socket.emit('mark_read', { messageId: msg.id, userId: CURRENT_USER_ID, workspaceId });
+            }
+            setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+        });
+
+        socket.on('read_update', (data: { messageId: string, reader: any }) => {
+            setMessages(prev => prev.map(m => {
+                if (m.id === data.messageId) {
+                    const currentReceipts = m.readReceipts || [];
+                    const alreadyRead = currentReceipts.some((r) => r.user.id === data.reader.id);
+                    if (!alreadyRead) {
+                        return { ...m, readReceipts: [...currentReceipts, { user: data.reader }] };
+                    }
+                }
+                return m;
+            }));
+        });
+
+        return () => {
+            socket.disconnect();
+        };
+    }, []);
+
+    const fetchMetadata = async () => {
+        try {
+            const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+            setTotalMembers(res.data.members?.length || 3);
+        } catch (e) {
+            console.error(e);
+        }
+    };
+
+    const loadMessages = async () => {
+        try {
+            const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}/chat`);
+            setMessages(res.data);
+
+            res.data.forEach((m: Message) => {
+                const currentReceipts = m.readReceipts || [];
+                const unreadByMe = m.userId !== CURRENT_USER_ID && !currentReceipts.some((r) => r.user.id === CURRENT_USER_ID);
+                if (unreadByMe) markAsRead(m.id);
+            });
+            setTimeout(() => flatListRef.current?.scrollToEnd({ animated: false }), 300);
+        } catch (error) {
+            console.error(error);
+        }
+    };
+
+    const markAsRead = (messageId: string) => {
+        socketRef.current?.emit('mark_read', { messageId, userId: CURRENT_USER_ID, workspaceId });
+    };
 
     const sendMessage = () => {
         if (!inputText.trim()) return;
-        const newMsg: Message = {
-            id: Date.now().toString(),
+        socketRef.current?.emit('send_message', {
+            workspaceId,
             userId: CURRENT_USER_ID,
-            userName: '김미니',
-            content: inputText.trim(),
-            createdAt: new Date().toISOString(),
-            readReceipts: [],
-        };
-        setMessages(prev => [...prev, newMsg]);
+            content: inputText.trim()
+        });
         setInputText('');
-        setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     };
 
-    const toggleMute = () => {
-        setIsMuted(prev => !prev);
-        // 실제 API: PUT /api/workspaces/:id/mute { userId, isMuted: !isMuted }
+    const toggleMute = async () => {
+        const newMuted = !isMuted;
+        setIsMuted(newMuted);
+        try {
+            await axios.put(`${API_URL}/api/workspaces/${workspaceId}/mute`, {
+                userId: CURRENT_USER_ID,
+                isMuted: newMuted
+            });
+        } catch (e) {
+            console.error(e);
+            setIsMuted(!newMuted); // revert
+        }
     };
 
     const openReceiptSheet = (msg: Message) => {
@@ -77,17 +139,19 @@ export default function WorkspaceChatScreen() {
 
     const renderMessage = ({ item }: { item: Message }) => {
         const isMe = item.userId === CURRENT_USER_ID;
-        const unreadCount = 3 - item.readReceipts.length; // 총 멤버 3명 기준 (예시)
+        // 서버에서 받아온 멤버 수에서 본인을 제외한 수(totalMembers - 1)와 현재 메시지의 읽음 개수를 비교
+        const readCount = item.readReceipts ? item.readReceipts.length : 0;
+        const unreadCount = Math.max(0, (totalMembers - 1) - readCount);
 
         return (
             <View style={[styles.messageRow, isMe ? styles.messageRowRight : styles.messageRowLeft]}>
                 {!isMe && (
                     <View style={styles.avatar}>
-                        <Text style={styles.avatarText}>{item.userName[0]}</Text>
+                        <Text style={styles.avatarText}>{item.user?.name?.[0] || '?'}</Text>
                     </View>
                 )}
                 <View style={styles.bubbleWrapper}>
-                    {!isMe && <Text style={styles.senderName}>{item.userName}</Text>}
+                    {!isMe && <Text style={styles.senderName}>{item.user?.name || '알 수 없음'}</Text>}
                     <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6 }}>
                         {isMe && (
                             <TouchableOpacity onPress={() => openReceiptSheet(item)}>
@@ -129,7 +193,7 @@ export default function WorkspaceChatScreen() {
                     </TouchableOpacity>
                     <View style={styles.headerCenter}>
                         <Text style={styles.headerTitle}>팀 채팅</Text>
-                        <Text style={styles.headerSub}>졸업작품 캡스톤</Text>
+                        <Text style={styles.headerSub}>{workspaceName}</Text>
                     </View>
                     <TouchableOpacity onPress={toggleMute} style={styles.muteButton}>
                         <Text style={styles.muteIcon}>{isMuted ? '🔕' : '🔔'}</Text>
