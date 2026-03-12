@@ -1,16 +1,45 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
-import Database from 'better-sqlite3';
-import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
+import prisma from '../lib/prisma';
 
 const router = Router();
-const adapter = new PrismaBetterSqlite3({ url: './dev.db' } as any);
-const prisma = new PrismaClient({ adapter });
 
 // 랜덤 6자리 초대 코드 생성 함수
 function generateInviteCode(): string {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
+
+// 3.9. 팀방 고정/해제 토글 API
+router.patch('/:id/pin', async (req: Request, res: Response) => {
+    try {
+        const workspaceId = (req.params.id as string).trim();
+        const userId = (req.body.userId as string || '').trim();
+
+        console.log(`[WORKSPACE] /pin request: wsId='${workspaceId}', userId='${userId}'`);
+
+        if (!userId) return res.status(400).json({ error: '사용자 ID가 필요합니다.' });
+
+        // 먼저 해당 멤버가 존재하는지 확인
+        const member = await prisma.workspaceMember.findFirst({
+            where: { userId, workspaceId }
+        });
+
+        if (!member) {
+            console.log(`[WORKSPACE] /pin FAILED: member not found for wsId='${workspaceId}', userId='${userId}'`);
+            return res.status(404).json({ error: '해당 팀방의 멤버가 아닙니다.' });
+        }
+
+        const updatedMember = await prisma.workspaceMember.update({
+            where: { id: member.id },
+            data: { isPinned: !member.isPinned }
+        });
+
+        console.log(`[WORKSPACE] /pin SUCCESS: wsId=${workspaceId}, userId=${userId}, isPinned=${updatedMember.isPinned}`);
+        res.status(200).json({ isPinned: updatedMember.isPinned });
+    } catch (error) {
+        console.error('[WORKSPACE] /pin internal error:', error);
+        res.status(500).json({ error: '팀방 고정 처리에 실패했습니다.' });
+    }
+});
 
 // 1. 방(Workspace) 생성 API
 router.post('/', async (req: Request, res: Response) => {
@@ -74,29 +103,38 @@ router.post('/', async (req: Request, res: Response) => {
     }
 });
 
-// 특정 사용자가 속해 있는 팀방(Workspace) 목록 반환 API
 router.get('/user/:userId', async (req: Request, res: Response) => {
     try {
         const userId = req.params.userId as string;
+        console.log(`[WORKSPACE] fetchWorkspaces for userId: ${userId}`);
 
         const memberships = await prisma.workspaceMember.findMany({
             where: { userId },
             include: {
                 workspace: true
-            }
+            },
+            orderBy: [
+                { isPinned: 'desc' }, // 고정된 방 우선
+                { joinedAt: 'desc' }  // 최근 가입한 방 우선
+            ]
         });
+
+        console.log(`[WORKSPACE] User ${userId} has ${memberships.length} memberships`);
 
         const workspaces = memberships.map((m: any) => ({
             ...m.workspace,
-            role: m.role
+            role: m.role,
+            isPinned: m.isPinned,
+            joinedAt: m.joinedAt
         }));
 
         res.status(200).json(workspaces);
     } catch (error) {
-        console.error(error);
+        console.error('[WORKSPACE] Error fetching user workspaces:', error);
         res.status(500).json({ error: 'Failed to fetch user workspaces' });
     }
 });
+
 
 // 2. 초대 코드로 방 참가하기 API
 router.post('/join', async (req: Request, res: Response) => {
@@ -241,11 +279,11 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
     }
 });
 
-// 3.6. 팀방 기본 정보 수정 API (이름, 마감일) - 팀장 전용
+// 3.6. 팀방 기본 정보 수정 API (이름, 마감일, 공지사항) - 팀장 전용
 router.patch('/:id', async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { name, deadline, userId } = req.body as { name?: string; deadline?: string; userId: string };
+        const { name, deadline, notice, userId } = req.body as { name?: string; deadline?: string; notice?: string; userId: string };
 
         if (!userId) return res.status(400).json({ error: '사용자 ID가 필요합니다.' });
 
@@ -259,8 +297,9 @@ router.patch('/:id', async (req: Request, res: Response) => {
         const updated = await prisma.workspace.update({
             where: { id: id as string },
             data: {
-                ...(name ? { name } : {}),
-                ...(deadline ? { deadline: new Date(deadline) } : { deadline: null }),
+                ...(name !== undefined ? { name } : {}),
+                ...(deadline !== undefined ? { deadline: deadline ? new Date(deadline) : null } : {}),
+                ...(notice !== undefined ? { notice } : {}),
             }
         });
         res.status(200).json(updated);
@@ -397,6 +436,15 @@ router.post('/:id/delegate', async (req: Request, res: Response) => {
         const { id } = req.params;
         const { fromUserId, toUserId } = req.body;
 
+        // 귄한 검증: fromUserId가 현재 팀방의 팀장인지 확인
+        const currentLeader = await prisma.workspaceMember.findUnique({
+            where: { userId_workspaceId: { userId: fromUserId as string, workspaceId: id as string } }
+        });
+
+        if (!currentLeader || currentLeader.role !== 'LEADER') {
+            return res.status(403).json({ error: '팀장만이 권한을 위임할 수 있습니다.' });
+        }
+
         await prisma.$transaction([
             prisma.workspaceMember.update({
                 where: { userId_workspaceId: { userId: fromUserId as string, workspaceId: id as string } },
@@ -407,6 +455,18 @@ router.post('/:id/delegate', async (req: Request, res: Response) => {
                 data: { role: 'LEADER' }
             })
         ]);
+
+        // [NEW] 실시간 소켓 알림 전송
+        const io = req.app.get('io');
+        const workspace = await prisma.workspace.findUnique({ where: { id: id as string } });
+        if (io && workspace) {
+            io.to(id).emit('role_delegated', {
+                workspaceId: id,
+                workspaceName: workspace.name,
+                newLeaderId: toUserId,
+                fromUserId: fromUserId
+            });
+        }
 
         res.status(200).json({ message: 'Successfully delegated leader role' });
     } catch (error) {

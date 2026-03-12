@@ -1,11 +1,7 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
-import Database from 'better-sqlite3';
-import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
+import prisma from '../lib/prisma';
 
 const router = Router();
-const adapter = new PrismaBetterSqlite3({ url: './dev.db' } as any);
-const prisma = new PrismaClient({ adapter });
 
 // 회원가입
 router.post('/register', async (req: Request, res: Response) => {

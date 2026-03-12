@@ -2,13 +2,24 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
     View, Text, StyleSheet, FlatList, TextInput,
     TouchableOpacity, KeyboardAvoidingView, Platform,
-    Modal, ScrollView
+    Modal, ScrollView, Image, ActivityIndicator, Alert
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import axios from 'axios';
 import { io, Socket } from 'socket.io-client';
+import * as ImagePicker from 'expo-image-picker';
+// expo-av가 네이티브 모듈 에러를 일으킬 수 있으므로 조건부 로드 시도
+let Video: any = null;
+let ResizeMode: any = { CONTAIN: 'contain' };
+try {
+    const expoAV = require('expo-av');
+    Video = expoAV.Video;
+    ResizeMode = expoAV.ResizeMode;
+} catch (e) {
+    console.warn('Native module ExponentAV not found. Video playback will be disabled.');
+}
 import { RootStackParamList } from '../App';
 
 const API_URL = Platform.OS === 'web' ? 'http://localhost:3000' : 'http://10.0.2.2:3000';
@@ -18,6 +29,8 @@ type Message = {
     userId: string;
     user: { id: string; name: string; avatarUrl: string | null };
     content: string;
+    type: 'TEXT' | 'IMAGE' | 'VIDEO';
+    fileUrl?: string;
     createdAt: string;
     readReceipts: { user: { id: string; name: string } }[];
 };
@@ -38,6 +51,7 @@ export default function WorkspaceChatScreen() {
     const [totalMembers, setTotalMembers] = useState(3); // 임시
 
     const socketRef = useRef<Socket | null>(null);
+    const [uploading, setUploading] = useState(false);
 
     useEffect(() => {
         fetchMetadata();
@@ -103,14 +117,87 @@ export default function WorkspaceChatScreen() {
         socketRef.current?.emit('mark_read', { messageId, userId: CURRENT_USER_ID, workspaceId });
     };
 
-    const sendMessage = () => {
-        if (!inputText.trim()) return;
-        socketRef.current?.emit('send_message', {
+    const sendMessage = (customData?: { type: 'IMAGE' | 'VIDEO'; fileUrl: string }) => {
+        if (!inputText.trim() && !customData) return;
+
+        const payload = customData ? {
             workspaceId,
             userId: CURRENT_USER_ID,
-            content: inputText.trim()
+            content: customData.type === 'IMAGE' ? '(사진)' : '(동영상)',
+            type: customData.type,
+            fileUrl: customData.fileUrl
+        } : {
+            workspaceId,
+            userId: CURRENT_USER_ID,
+            content: inputText.trim(),
+            type: 'TEXT'
+        };
+
+        socketRef.current?.emit('send_message', payload);
+        if (!customData) setInputText('');
+    };
+
+    const handlePickMedia = async () => {
+        try {
+            const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+            if (!permission.granted) {
+                Alert.alert('권한 필요', '갤러리 접근 권한이 필요합니다.');
+                return;
+            }
+
+            const result = await ImagePicker.launchImageLibraryAsync({
+                mediaTypes: ['images', 'videos'],
+                quality: 0.7,
+            });
+
+            if (!result.canceled && result.assets && result.assets.length > 0) {
+                const asset = result.assets[0];
+                setUploading(true);
+
+                const fileUrl = await uploadFile(asset.uri);
+                const type = asset.type === 'video' ? 'VIDEO' : 'IMAGE';
+
+                if (type === 'VIDEO' && !Video) {
+                    Alert.alert('알림', '현재 환경에서는 동영상 전송/재생이 지원되지 않습니다. (Expo Go 업데이트 필요)');
+                    return;
+                }
+
+                sendMessage({ type, fileUrl });
+            }
+        } catch (e) {
+            console.error('[PICK_MEDIA] error:', e);
+            Alert.alert('오류', '미디어를 선택하는 중 오류가 발생했습니다.');
+        } finally {
+            setUploading(false);
+        }
+    };
+
+    const uploadFile = async (uri: string): Promise<string> => {
+        const formData = new FormData();
+        const filename = uri.split('/').pop() || 'upload.jpg';
+        const match = /\.(\w+)$/.exec(filename);
+        const type = match ? `image/${match[1]}` : `image/jpeg`;
+
+        if (Platform.OS === 'web') {
+            // 웹 환경에서는 URI에서 블롭(Blob)을 직접 추출해야 함
+            const response = await fetch(uri);
+            const blob = await response.blob();
+            formData.append('file', blob, filename);
+        } else {
+            // 모바일 환경 (Android/iOS)
+            // @ts-ignore
+            formData.append('file', {
+                uri: Platform.OS === 'android' ? uri : uri.replace('file://', ''),
+                name: filename,
+                type,
+            });
+        }
+
+        const res = await axios.post(`${API_URL}/api/upload`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
         });
-        setInputText('');
+
+        return res.data.fileUrl;
     };
 
     const toggleMute = async () => {
@@ -164,7 +251,29 @@ export default function WorkspaceChatScreen() {
                             onLongPress={() => openReceiptSheet(item)}
                             style={[styles.bubble, isMe ? styles.bubbleMe : styles.bubbleOther]}
                         >
-                            <Text style={styles.bubbleText}>{item.content}</Text>
+                            {item.type === 'IMAGE' && item.fileUrl ? (
+                                <Image
+                                    source={{ uri: `${API_URL}${item.fileUrl}` }}
+                                    style={styles.messageImage}
+                                    resizeMode="cover"
+                                />
+                            ) : item.type === 'VIDEO' && item.fileUrl ? (
+                                Video ? (
+                                    <Video
+                                        source={{ uri: `${API_URL}${item.fileUrl}` }}
+                                        style={styles.messageVideo}
+                                        useNativeControls
+                                        resizeMode={ResizeMode.CONTAIN}
+                                        isLooping={false}
+                                    />
+                                ) : (
+                                    <View style={[styles.messageVideo, { backgroundColor: '#334155', justifyContent: 'center', alignItems: 'center' }]}>
+                                        <Text style={{ color: '#fff', fontSize: 12, textAlign: 'center' }}>동영상 재생 불가{"\n"}(모듈 없음)</Text>
+                                    </View>
+                                )
+                            ) : (
+                                <Text style={styles.bubbleText}>{item.content}</Text>
+                            )}
                         </TouchableOpacity>
                         {!isMe && (
                             <TouchableOpacity onPress={() => openReceiptSheet(item)}>
@@ -203,9 +312,9 @@ export default function WorkspaceChatScreen() {
 
                 {/* 메시지 목록 */}
                 <KeyboardAvoidingView
-                    behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                    behavior={Platform.OS === 'ios' ? 'padding' : undefined}
                     style={{ flex: 1 }}
-                    keyboardVerticalOffset={0}
+                    keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
                 >
                     <FlatList
                         ref={flatListRef}
@@ -218,6 +327,13 @@ export default function WorkspaceChatScreen() {
 
                     {/* 입력창 */}
                     <View style={styles.inputRow}>
+                        <TouchableOpacity style={styles.attachButton} onPress={handlePickMedia} disabled={uploading}>
+                            {uploading ? (
+                                <ActivityIndicator size="small" color="#60a5fa" />
+                            ) : (
+                                <Text style={styles.attachIcon}>+</Text>
+                            )}
+                        </TouchableOpacity>
                         <TextInput
                             style={styles.input}
                             placeholder="메시지를 입력하세요..."
@@ -228,7 +344,7 @@ export default function WorkspaceChatScreen() {
                         />
                         <TouchableOpacity
                             style={[styles.sendButton, !inputText.trim() && styles.sendButtonDisabled]}
-                            onPress={sendMessage}
+                            onPress={() => sendMessage()}
                             disabled={!inputText.trim()}
                         >
                             <LinearGradient colors={['#4f46e5', '#3b82f6']} style={styles.sendGradient}>
@@ -298,13 +414,38 @@ const styles = StyleSheet.create({
     bubbleMe: { backgroundColor: '#4f46e5', borderBottomRightRadius: 4 },
     bubbleOther: { backgroundColor: 'rgba(255,255,255,0.1)', borderBottomLeftRadius: 4 },
     bubbleText: { color: '#fff', fontSize: 15, lineHeight: 22 },
+    messageImage: {
+        width: 200,
+        height: 200,
+        borderRadius: 12,
+    },
+    messageVideo: {
+        width: 200,
+        height: 150,
+        borderRadius: 12,
+    },
+    attachButton: {
+        width: 44,
+        height: 44,
+        borderRadius: 22,
+        backgroundColor: 'rgba(255,255,255,0.15)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginRight: 10,
+        marginBottom: 2,
+    },
+    attachIcon: {
+        color: '#60a5fa',
+        fontSize: 24,
+        fontWeight: '700',
+    },
     timestamp: { fontSize: 11, color: 'rgba(255,255,255,0.35)', marginTop: 4 },
     timestampRight: { textAlign: 'right' },
     timestampLeft: { textAlign: 'left' },
     unreadBadgeMe: { color: 'rgba(255,255,255,0.4)', fontSize: 11 },
     unreadBadgeOther: { color: '#f59e0b', fontSize: 12, fontWeight: '700' },
     inputRow: {
-        flexDirection: 'row', alignItems: 'flex-end', gap: 10,
+        flexDirection: 'row', alignItems: 'flex-end',
         paddingHorizontal: 16, paddingVertical: 10,
         borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)',
     },

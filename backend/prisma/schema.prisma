@@ -30,6 +30,7 @@ model Workspace {
   inviteCode String    @unique
   name       String
   subject    String?
+  notice     String?   // [NEW] 공지사항 필드 추가
   deadline   DateTime?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
@@ -49,6 +50,7 @@ model WorkspaceMember {
   user      User      @relation(fields: [userId], references: [id])
   workspace Workspace @relation(fields: [workspaceId], references: [id])
   isMuted   Boolean   @default(false)
+  isPinned  Boolean   @default(false) // [NEW] 팀방 고정 여부
 
   @@unique([userId, workspaceId])
 }
@@ -58,6 +60,8 @@ model ChatMessage {
   workspaceId String
   userId      String
   content     String
+  type        String   @default("TEXT") // TEXT, IMAGE, VIDEO
+  fileUrl     String?
   createdAt   DateTime @default(now())
 
   workspace    Workspace            @relation(fields: [workspaceId], references: [id])

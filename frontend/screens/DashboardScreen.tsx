@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ScrollView, Dimensions, TouchableOpacity, Platform, ActivityIndicator, Alert, Modal, TextInput } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Dimensions, TouchableOpacity, Platform, ActivityIndicator, Alert, Modal, TextInput, RefreshControl } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRoute, RouteProp, useNavigation, useFocusEffect } from '@react-navigation/native';
@@ -27,6 +27,9 @@ export default function DashboardScreen() {
     // 안 읽은 채팅 개수
     const [unreadChatCount, setUnreadChatCount] = useState(0);
     const socketRef = React.useRef<Socket | null>(null);
+
+    // Pull to Refresh state
+    const [refreshing, setRefreshing] = useState(false);
 
     // Custom Confirm Modal State for Web Compatibility
     const [confirmVisible, setConfirmVisible] = useState(false);
@@ -57,7 +60,12 @@ export default function DashboardScreen() {
     const [isSettingsVisible, setSettingsVisible] = useState(false);
     const [editingName, setEditingName] = useState('');
     const [editingDeadline, setEditingDeadline] = useState('');
+    const [editingNotice, setEditingNotice] = useState(''); // [NEW] 공지사항 수정 state
     const [showSettingsDatePicker, setShowSettingsDatePicker] = useState(false);
+
+    // [NEW] 팀장 여부 확인 변수
+    const currentUserMember = workspace?.members?.find((m: any) => m.userId === USER_ID);
+    const isLeader = currentUserMember?.role === 'LEADER';
 
     const toggleAssignee = (userId: string) => {
         setNewTaskAssignees(prev =>
@@ -139,6 +147,24 @@ export default function DashboardScreen() {
             socket.on('new_message', (msg: any) => {
                 if (msg.userId !== USER_ID) {
                     setUnreadChatCount(prev => prev + 1);
+                }
+            });
+
+            socket.on('role_delegated', async (msg: any) => {
+                // 팀장 위임 알림 (본인이 새로운 팀장이 된 경우)
+                if (msg.workspaceId === workspaceId) {
+                    // 정보 최신화
+                    try {
+                        const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+                        setWorkspace(res.data);
+                    } catch (e) {
+                        console.error('Failed to sync workspace after delegation:', e);
+                    }
+
+                    if (msg.newLeaderId === USER_ID) {
+                        if (Platform.OS === 'web') window.alert(`📢 [${msg.workspaceName}] 팀방의 팀장으로 위임되었습니다!`);
+                        else Alert.alert('권한 위임 알림', `📢 [${msg.workspaceName}] 팀방의 팀장으로 위임되었습니다!`);
+                    }
                 }
             });
 
@@ -227,10 +253,12 @@ export default function DashboardScreen() {
             await axios.patch(`${API_URL}/api/workspaces/${workspaceId}`, {
                 userId: USER_ID,
                 name: editingName || undefined,
-                deadline: editingDeadline || undefined,
+                deadline: editingDeadline || null, // 빈 값이면 null 전송 (삭제 허용)
+                notice: editingNotice, // 빈 값도 전송 (삭제 허용)
             });
             const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
             setWorkspace(res.data);
+            setSettingsVisible(false); // 모달 닫기
             if (Platform.OS === 'web') window.alert('팀방 정보가 수정되었습니다!');
             else Alert.alert('완료', '팀방 정보가 수정되었습니다!');
         } catch (e: any) {
@@ -254,7 +282,26 @@ export default function DashboardScreen() {
         }
     };
 
+    const onRefresh = React.useCallback(async () => {
+        setRefreshing(true);
+        try {
+            const [workspaceRes, unreadRes] = await Promise.all([
+                axios.get(`${API_URL}/api/workspaces/${workspaceId}`),
+                axios.get(`${API_URL}/api/workspaces/${workspaceId}/chat/unread`, {
+                    params: { userId: USER_ID }
+                })
+            ]);
+            setWorkspace(workspaceRes.data);
+            setUnreadChatCount(unreadRes.data.unreadCount || 0);
+        } catch (error) {
+            console.error('Failed to refresh dashboard:', error);
+        } finally {
+            setRefreshing(false);
+        }
+    }, [workspaceId, USER_ID]);
+
     const kickMember = (targetUserId: string, targetName: string) => {
+        setSettingsVisible(false); // 설정 모달 먼저 닫기 (중첩 모달 이슈 방지)
         setConfirmDetails({
             title: '팀원 내보내기',
             message: `${targetName}님을 팀방에서\n내보내시겠습니까?`,
@@ -274,7 +321,10 @@ export default function DashboardScreen() {
                     else Alert.alert('오류', msg);
                 }
             },
-            onCancel: () => setConfirmVisible(false),
+            onCancel: () => {
+                setConfirmVisible(false);
+                setSettingsVisible(true); // 취소 시 다시 설정 모달 열기
+            },
         });
         setConfirmVisible(true);
     };
@@ -314,8 +364,6 @@ export default function DashboardScreen() {
     }
 
     const handleLeaveWorkspace = () => {
-        const currentUserMember = workspace?.members?.find((m: any) => m.userId === USER_ID);
-        const isLeader = currentUserMember?.role === 'LEADER';
         const userName = currentUserMember?.user?.name || '사용자';
 
         if (isLeader) {
@@ -326,7 +374,7 @@ export default function DashboardScreen() {
                 cancelText: "아니오",
                 onConfirm: () => {
                     setConfirmVisible(false);
-                    setTimeout(() => setDelegationModalVisible(true), 100); // small delay to allow modal transition
+                    setTimeout(() => setSettingsVisible(true), 100); // small delay to allow modal transition
                 },
                 onCancel: async () => {
                     setConfirmVisible(false);
@@ -375,6 +423,7 @@ export default function DashboardScreen() {
     };
 
     const handleDelegate = (targetMember: any) => {
+        setSettingsVisible(false); // 설정 모달 먼저 닫기
         setConfirmDetails({
             title: "권한 위임",
             message: `선택하신 사람은 ${targetMember.user?.name}님 입니다.\n팀장 권한을 위임하시겠습니까?`,
@@ -387,8 +436,13 @@ export default function DashboardScreen() {
                         fromUserId: USER_ID,
                         toUserId: targetMember.userId
                     });
-                    setDelegationModalVisible(false);
-                    leaveWorkspaceAction();
+
+                    // 위임 성공 후 정보 갱신 (팀방에서 나가지 않음)
+                    const res = await axios.get(`${API_URL}/api/workspaces/${workspaceId}`);
+                    setWorkspace(res.data);
+
+                    if (Platform.OS === 'web') window.alert(`${targetMember.user?.name}님께 팀장 권한이 위임되었습니다.`);
+                    else Alert.alert("완료", `${targetMember.user?.name}님께 팀장 권한이 위임되었습니다.`);
                 } catch (error) {
                     console.error('Failed to delegate role:', error);
                     if (Platform.OS === 'web') window.alert("팀장 권한 위임에 실패했습니다.");
@@ -397,6 +451,7 @@ export default function DashboardScreen() {
             },
             onCancel: () => {
                 setConfirmVisible(false);
+                setSettingsVisible(true); // 취소 시 다시 설정 모달 열기
             }
         });
         setConfirmVisible(true);
@@ -419,12 +474,54 @@ export default function DashboardScreen() {
                         <Text style={styles.greeting}>안녕하세요!</Text>
                         <Text style={styles.projectTitle}>{workspace?.name || workspaceName}</Text>
                     </View>
-                    <TouchableOpacity onPress={handleLeaveWorkspace} style={styles.leaveButton}>
-                        <Text style={styles.leaveButtonText}>나가기</Text>
-                    </TouchableOpacity>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                        {/* [NEW] 설정 버튼(톱니바퀴) - 팀장에게만 노출 */}
+                        {isLeader && (
+                            <TouchableOpacity
+                                onPress={() => {
+                                    setEditingName(workspace?.name || '');
+                                    setEditingDeadline(workspace?.deadline ? new Date(workspace.deadline).toISOString().split('T')[0] : '');
+                                    setEditingNotice(workspace?.notice || '');
+                                    setSettingsVisible(true);
+                                }}
+                                style={styles.settingsButton}
+                            >
+                                <Text style={styles.settingsButtonText}>⚙️</Text>
+                            </TouchableOpacity>
+                        )}
+                        <TouchableOpacity onPress={handleLeaveWorkspace} style={styles.leaveButton}>
+                            <Text style={styles.leaveButtonText}>나가기</Text>
+                        </TouchableOpacity>
+                    </View>
                 </View>
 
-                <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+                <ScrollView
+                    showsVerticalScrollIndicator={false}
+                    contentContainerStyle={styles.scrollContent}
+                    refreshControl={
+                        <RefreshControl
+                            refreshing={refreshing}
+                            onRefresh={onRefresh}
+                            tintColor="#6366f1"
+                            colors={["#6366f1"]}
+                        />
+                    }
+                >
+
+                    {/* [NEW] 공지사항 섹션 - 대시보드 최상단 고정 */}
+                    <View style={styles.noticeCard}>
+                        <View style={styles.noticeHeader}>
+                            <Text style={styles.noticeLabel}>📢 공지사항</Text>
+                            {workspace?.updatedAt && (
+                                <Text style={styles.noticeTime}>
+                                    {new Date(workspace.updatedAt).toLocaleDateString()} 업데이트
+                                </Text>
+                            )}
+                        </View>
+                        <Text style={styles.noticeContent}>
+                            {workspace?.notice || '등록된 공지사항이 없습니다. 팀장님은 설정에서 공지사항을 등록해 주세요!'}
+                        </Text>
+                    </View>
 
                     <View style={styles.glassCard}>
                         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
@@ -444,7 +541,7 @@ export default function DashboardScreen() {
                     <View style={styles.glassCard}>
                         {workspace?.members?.map((member: any, index: number) => (
                             <View key={member.id} style={styles.rankRow}>
-                                <Text style={styles.rankIcon}>{index === 0 ? '👑' : '👤'}</Text>
+                                <Text style={styles.rankIcon}>{member.role === 'LEADER' ? '👑' : '👤'}</Text>
                                 <View style={styles.rankInfo}>
                                     <Text style={styles.rankName}>{member.user?.name || '알 수 없음'}</Text>
                                     <Text style={styles.rankPoints}>{member.role === 'LEADER' ? '팀장' : '팀원'}</Text>
@@ -809,6 +906,151 @@ export default function DashboardScreen() {
                                 <Text style={styles.confirmOkText}>{confirmDetails.confirmText}</Text>
                             </TouchableOpacity>
                         </View>
+                    </View>
+                </View>
+            </Modal>
+
+            {/* 설정 모달 (팀장 전용) */}
+            <Modal
+                visible={isSettingsVisible}
+                transparent={true}
+                animationType="slide"
+                onRequestClose={() => setSettingsVisible(false)}
+            >
+                <View style={styles.taskModalOverlay}>
+                    <TouchableOpacity
+                        style={{ flex: 1 }}
+                        activeOpacity={1}
+                        onPress={() => setSettingsVisible(false)}
+                    />
+                    <View style={styles.taskModalSheet}>
+                        <View style={styles.taskModalHandle} />
+                        <Text style={styles.taskModalTitle}>⚙️ 팀방 설정</Text>
+
+                        <ScrollView
+                            showsVerticalScrollIndicator={false}
+                            keyboardShouldPersistTaps="handled"
+                            contentContainerStyle={{ paddingBottom: 32 }}
+                        >
+                            <Text style={styles.settingsSectionTitle}>📌 기본 정보 수정</Text>
+
+                            <Text style={styles.taskInputLabel}>팀방 이름</Text>
+                            <TextInput
+                                style={styles.taskInput}
+                                value={editingName}
+                                onChangeText={setEditingName}
+                                placeholder="팀방 이름을 입력하세요"
+                                placeholderTextColor="rgba(255,255,255,0.3)"
+                            />
+
+                            <Text style={styles.taskInputLabel}>📢 공지사항</Text>
+                            <TextInput
+                                style={[styles.taskInput, { height: 80 }]}
+                                value={editingNotice}
+                                onChangeText={setEditingNotice}
+                                placeholder="팀원들에게 알릴 공지사항을 입력하세요"
+                                placeholderTextColor="rgba(255,255,255,0.3)"
+                                multiline
+                                textAlignVertical="top"
+                            />
+
+                            <View style={{ marginTop: 18 }}>
+                                <Text style={styles.taskInputLabel}>마감일</Text>
+                                {Platform.OS === 'web' ? (
+                                    <input
+                                        type="date"
+                                        value={editingDeadline}
+                                        onChange={(e) => setEditingDeadline(e.target.value)}
+                                        style={{
+                                            backgroundColor: 'rgba(255,255,255,0.06)',
+                                            borderRadius: 14,
+                                            padding: '14px 16px',
+                                            color: '#fff',
+                                            fontSize: 15,
+                                            border: '1px solid rgba(255,255,255,0.1)',
+                                            outline: 'none',
+                                            width: '100%',
+                                            boxSizing: 'border-box'
+                                        }}
+                                    />
+                                ) : (
+                                    <>
+                                        <TouchableOpacity
+                                            style={styles.taskInput}
+                                            onPress={() => setShowSettingsDatePicker(true)}
+                                        >
+                                            <Text style={{ color: editingDeadline ? '#fff' : 'rgba(255,255,255,0.3)', fontSize: 15 }}>
+                                                {editingDeadline || '날짜 선택...'}
+                                            </Text>
+                                        </TouchableOpacity>
+                                        {showSettingsDatePicker && (
+                                            <DateTimePicker
+                                                value={editingDeadline ? new Date(editingDeadline) : new Date()}
+                                                mode="date"
+                                                display="default"
+                                                onChange={(event, date) => {
+                                                    setShowSettingsDatePicker(false);
+                                                    if (date) setEditingDeadline(date.toISOString().split('T')[0]);
+                                                }}
+                                            />
+                                        )}
+                                    </>
+                                )}
+                            </View>
+
+                            <TouchableOpacity
+                                style={[styles.completeButton, { marginTop: 24, alignSelf: 'stretch', backgroundColor: '#4f46e5' }]}
+                                onPress={updateWorkspace}
+                            >
+                                <Text style={styles.completeButtonText}>정보 저장하기</Text>
+                            </TouchableOpacity>
+
+                            <View style={styles.settingsDivider} />
+
+                            <Text style={styles.settingsSectionTitle}>🔑 초대 코드 관리</Text>
+                            <View style={styles.inviteCodeContainer}>
+                                <View style={styles.inviteCodeBox}>
+                                    <Text style={styles.inviteCodeLabel}>현재 코드</Text>
+                                    <Text style={styles.inviteCodeText}>{workspace?.inviteCode}</Text>
+                                </View>
+                                <TouchableOpacity
+                                    style={styles.regenerateButton}
+                                    onPress={regenerateInvite}
+                                >
+                                    <Text style={styles.regenerateButtonText}>재발급</Text>
+                                </TouchableOpacity>
+                            </View>
+
+                            <View style={styles.settingsDivider} />
+
+                            <Text style={styles.settingsSectionTitle}>👥 팀원 관리</Text>
+                            {workspace?.members?.map((member: any) => (
+                                <View key={member.id} style={styles.settingsMemberRow}>
+                                    <View style={{ flex: 1 }}>
+                                        <Text style={styles.settingsMemberName}>
+                                            {member.user?.name} {member.role === 'LEADER' && '👑'}
+                                        </Text>
+                                        <Text style={styles.settingsMemberEmail}>{member.user?.email}</Text>
+                                    </View>
+                                    {member.userId !== USER_ID && (
+                                        <View style={{ flexDirection: 'row', gap: 6 }}>
+                                            <TouchableOpacity
+                                                style={styles.memberActionBtn}
+                                                onPress={() => handleDelegate(member)}
+                                            >
+                                                <Text style={styles.memberActionBtnText}>위임</Text>
+                                            </TouchableOpacity>
+                                            <TouchableOpacity
+                                                style={[styles.memberActionBtn, { backgroundColor: 'rgba(239,68,68,0.15)', borderColor: 'rgba(239,68,68,0.3)' }]}
+                                                onPress={() => kickMember(member.userId, member.user?.name)}
+                                            >
+                                                <Text style={[styles.memberActionBtnText, { color: '#ef4444' }]}>내보내기</Text>
+                                            </TouchableOpacity>
+                                        </View>
+                                    )}
+                                </View>
+                            ))}
+                        </ScrollView>
                     </View>
                 </View>
             </Modal>
@@ -1262,5 +1504,125 @@ const styles = StyleSheet.create({
         height: 10,
         backgroundColor: '#6366f1',
         borderRadius: 5,
+    },
+    // ─── 설정 & 공지사항 추가 스타일 ───
+    settingsButton: {
+        width: 40, height: 40,
+        borderRadius: 20,
+        backgroundColor: 'rgba(255,255,255,0.1)',
+        justifyContent: 'center', alignItems: 'center',
+        borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)',
+    },
+    settingsButtonText: {
+        fontSize: 20,
+    },
+    noticeCard: {
+        backgroundColor: 'rgba(96, 165, 250, 0.12)',
+        borderRadius: 20,
+        padding: 20,
+        borderWidth: 1,
+        borderColor: 'rgba(96, 165, 250, 0.3)',
+        marginBottom: 20,
+    },
+    noticeHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: 10,
+    },
+    noticeLabel: {
+        color: '#60a5fa',
+        fontSize: 14,
+        fontWeight: 'bold',
+    },
+    noticeTime: {
+        color: 'rgba(255,255,255,0.4)',
+        fontSize: 11,
+    },
+    noticeContent: {
+        color: '#fff',
+        fontSize: 15,
+        lineHeight: 22,
+    },
+    settingsSectionTitle: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: 'bold',
+        marginTop: 24,
+        marginBottom: 8,
+    },
+    settingsDivider: {
+        height: 1,
+        backgroundColor: 'rgba(255,255,255,0.1)',
+        marginVertical: 24,
+    },
+    inviteCodeContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 12,
+        marginTop: 8,
+    },
+    inviteCodeBox: {
+        flex: 1,
+        backgroundColor: 'rgba(255,255,255,0.05)',
+        borderRadius: 14,
+        padding: 12,
+        paddingHorizontal: 16,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.1)',
+    },
+    inviteCodeLabel: {
+        color: 'rgba(255,255,255,0.4)',
+        fontSize: 11,
+        marginBottom: 4,
+    },
+    inviteCodeText: {
+        color: '#60a5fa',
+        fontSize: 18,
+        fontWeight: 'bold',
+        letterSpacing: 1,
+    },
+    regenerateButton: {
+        backgroundColor: 'rgba(96, 165, 250, 0.15)',
+        borderWidth: 1,
+        borderColor: 'rgba(96, 165, 250, 0.4)',
+        borderRadius: 12,
+        paddingHorizontal: 16,
+        paddingVertical: 12,
+    },
+    regenerateButtonText: {
+        color: '#60a5fa',
+        fontWeight: 'bold',
+        fontSize: 14,
+    },
+    settingsMemberRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 14,
+        borderBottomWidth: 1,
+        borderBottomColor: 'rgba(255,255,255,0.05)',
+    },
+    settingsMemberName: {
+        color: '#fff',
+        fontSize: 15,
+        fontWeight: '600',
+    },
+    settingsMemberEmail: {
+        color: 'rgba(255,255,255,0.4)',
+        fontSize: 12,
+        marginTop: 2,
+    },
+    memberActionBtn: {
+        paddingHorizontal: 10,
+        paddingVertical: 6,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: 'rgba(255,255,255,0.2)',
+        backgroundColor: 'rgba(255,255,255,0.05)',
+    },
+    memberActionBtnText: {
+        color: 'rgba(255,255,255,0.7)',
+        fontSize: 12,
+        fontWeight: '600',
     },
 });
